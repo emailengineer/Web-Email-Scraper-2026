@@ -129,10 +129,33 @@ class WebScraper:
                 'User-Agent': settings.user_agent
             })
             
-            # Navigate to page
+            # Navigate to page and wait for full load
             await page.goto(url, wait_until='networkidle', timeout=settings.page_load_timeout * 1000)
             
-            # Get HTML content
+            # Scroll to bottom to ensure footer and all content loads
+            await page.evaluate("""
+                async () => {
+                    await new Promise((resolve) => {
+                        let totalHeight = 0;
+                        const distance = 100;
+                        const timer = setInterval(() => {
+                            const scrollHeight = document.body.scrollHeight;
+                            window.scrollBy(0, distance);
+                            totalHeight += distance;
+                            
+                            if(totalHeight >= scrollHeight){
+                                clearInterval(timer);
+                                resolve();
+                            }
+                        }, 100);
+                    });
+                }
+            """)
+            
+            # Wait a bit more for any lazy-loaded content
+            await page.wait_for_timeout(1000)
+            
+            # Get full HTML content (including all dynamically loaded content)
             html = await page.content()
             
             return html
@@ -153,7 +176,11 @@ class WebScraper:
     async def _scrape_with_http(self, url: str) -> str:
         """Scrape page using HTTP request."""
         try:
-            response = await self.http_client.get(url)
+            # Use longer timeout to ensure full page loads
+            response = await self.http_client.get(
+                url,
+                timeout=httpx.Timeout(settings.page_load_timeout + 5, connect=10.0)
+            )
             response.raise_for_status()
             return response.text
         except httpx.TimeoutException:
