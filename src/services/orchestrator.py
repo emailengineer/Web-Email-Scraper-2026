@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from src.core.config import settings
 from src.core.logger import get_logger
 from src.utils.patterns import CONTACT_PAGES
+from src.utils.public_email_providers import is_valid_email_domain
 from src.services.url_processor import URLProcessor
 from src.services.scraper import WebScraper
 from src.services.email_extractor import EmailExtractor
@@ -163,32 +164,38 @@ class ScrapingOrchestrator:
                 return result
             
             # Scrape discovered and fixed pages (concurrently if enabled)
-            if settings.concurrent_scraping and len(urls_to_try) > 1:
-                # Check timeout before concurrent scraping
+            # Always use concurrent scraping for better performance and to avoid race conditions
+            if len(urls_to_try) > 0:
+                # Check timeout before scraping
                 if time.time() - start_time > timeout:
-                    logger.warning("Timeout reached before concurrent scraping", domain=root_domain)
+                    logger.warning("Timeout reached before scraping pages", domain=root_domain)
                     result["total_pages"] = len(result["pages_visited"])
                     result["execution_time"] = time.time() - start_time
                     return result
                 
+                # Use concurrent scraping for all pages (more reliable)
                 logger.info("Scraping pages concurrently", count=len(urls_to_try), domain=root_domain)
-                scraping_results = await self.scraper.scrape_multiple(urls_to_try)
-            else:
-                # Sequential scraping with timeout checks
+                
+                # Process in batches to avoid overwhelming the system
+                batch_size = settings.max_concurrent_requests
                 scraping_results = []
-                for url_to_try in urls_to_try:
-                    # Check timeout before each request
+                
+                for i in range(0, len(urls_to_try), batch_size):
+                    # Check timeout before each batch
                     if time.time() - start_time > timeout:
-                        logger.warning("Timeout reached during sequential scraping", domain=root_domain)
+                        logger.warning("Timeout reached before batch", domain=root_domain, batch=i//batch_size)
                         break
                     
-                    page_result = await self.scraper.scrape_page(url_to_try)
-                    scraping_results.append(page_result)
+                    batch_urls = urls_to_try[i:i + batch_size]
+                    batch_results = await self.scraper.scrape_multiple(batch_urls)
+                    scraping_results.extend(batch_results)
                     
-                    # Check timeout after each request
+                    # Check timeout after batch
                     if time.time() - start_time > timeout:
-                        logger.warning("Timeout reached after scraping page", domain=root_domain)
+                        logger.warning("Timeout reached after batch", domain=root_domain)
                         break
+            else:
+                scraping_results = []
             
             # Process all results - track both successful and failed pages
             all_emails: Set[str] = set()
@@ -199,6 +206,10 @@ class ScrapingOrchestrator:
             for url, page in url_to_page_map.items():
                 normalized_url = self.url_processor.normalize_url(url)
                 normalized_url_to_page[normalized_url] = page
+            
+            # Process ALL results - don't break early
+            total_results = len(scraping_results)
+            logger.info("Processing scraping results", total=total_results, domain=root_domain)
             
             for i, page_result in enumerate(scraping_results):
                 # Get the page path from URL mapping
@@ -235,12 +246,7 @@ class ScrapingOrchestrator:
                                page=page_path, error=page_result.get("error"))
                     continue
                 
-                # Check timeout during processing
-                if time.time() - start_time > timeout:
-                    logger.warning("Timeout reached during result processing", domain=root_domain)
-                    break
-                
-                # Extract emails from successful page
+                # Extract emails from successful page (process all pages, don't break early)
                 try:
                     page_emails = self.email_extractor.extract_emails(page_result["html"], page_result["url"])
                     all_emails.update(page_emails)
@@ -253,15 +259,18 @@ class ScrapingOrchestrator:
                             result["emails"].extend(valid_emails)
                             found_valid_email = True
                             logger.info("Valid emails found", domain=root_domain, page=page_path, count=len(valid_emails))
-                            # Continue processing to find all emails, but we found at least one
+                            # Continue processing ALL pages to find all emails
+                            
                 except Exception as e:
                     logger.warning("Email extraction failed", page=page_path, error=str(e))
                     continue
                 
-                # Check max pages limit
-                if len(result["pages_visited"]) >= max_pages:
-                    logger.info("Max pages reached", domain=root_domain, pages=len(result["pages_visited"]))
-                    break
+                # Log progress
+                if (i + 1) % 10 == 0:
+                    logger.debug("Processing progress", 
+                               processed=i+1, 
+                               total=total_results, 
+                               domain=root_domain)
             
             # If we collected emails but haven't validated them all yet, validate now
             if all_emails and not found_valid_email:
@@ -300,6 +309,7 @@ class ScrapingOrchestrator:
     async def _validate_emails(self, emails: Set[str], domain: str, found_on: str) -> List[Dict[str, Any]]:
         """
         Validate emails and return only those with valid MX records.
+        Accepts emails from target domain OR public email providers.
         
         Args:
             emails: Set of email addresses
@@ -311,15 +321,31 @@ class ScrapingOrchestrator:
         """
         valid_emails = []
         
-        # Filter emails by domain first
-        domain_emails = {email for email in emails if email.endswith(f'@{domain}')}
+        # Filter emails by domain (target domain OR public email providers)
+        filtered_emails = set()
+        for email in emails:
+            if '@' not in email:
+                continue
+            
+            email_domain = email.split('@')[1].lower()
+            
+            # Accept target domain or public email providers
+            if is_valid_email_domain(email_domain, domain):
+                filtered_emails.add(email)
         
-        if not domain_emails:
-            logger.debug("No emails matching domain", domain=domain)
+        if not filtered_emails:
+            logger.debug("No emails matching domain or public providers", 
+                        domain=domain, 
+                        total_emails=len(emails))
             return valid_emails
         
-        # Validate emails
-        validation_results = self.mx_validator.validate_emails_batch(list(domain_emails))
+        logger.debug("Filtered emails for validation", 
+                    domain=domain,
+                    filtered=len(filtered_emails),
+                    total=len(emails))
+        
+        # Validate emails (MX check will filter invalid ones)
+        validation_results = self.mx_validator.validate_emails_batch(list(filtered_emails))
         
         for validation in validation_results:
             if validation["valid_format"] and validation["has_mx"]:
