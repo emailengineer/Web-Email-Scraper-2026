@@ -3,6 +3,7 @@
 import time
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime
+from urllib.parse import urlparse
 
 from src.core.config import settings
 from src.core.logger import get_logger
@@ -12,6 +13,7 @@ from src.services.scraper import WebScraper
 from src.services.email_extractor import EmailExtractor
 from src.services.mx_validator import MXValidator
 from src.services.cache_manager import CacheManager
+from src.services.link_discoverer import LinkDiscoverer
 
 logger = get_logger(__name__)
 
@@ -26,6 +28,7 @@ class ScrapingOrchestrator:
         self.email_extractor = EmailExtractor()
         self.cache_manager = CacheManager()
         self.mx_validator = MXValidator(self.cache_manager)
+        self.link_discoverer = LinkDiscoverer()
     
     async def initialize(self) -> None:
         """Initialize services that require async setup."""
@@ -102,29 +105,65 @@ class ScrapingOrchestrator:
             else:
                 logger.warning("Root page scraping failed", domain=root_domain, error=root_result.get("error"))
             
-            # Step 4: If no valid emails found, try contact pages
-            logger.info("No valid emails on root, trying contact pages", domain=root_domain)
+            # Step 4: Discover links from homepage, sitemap, etc.
+            logger.info("Discovering links from website", domain=root_domain)
             
-            # Limit pages to visit (accounting for root page already visited)
-            pages_to_try = CONTACT_PAGES[:max_pages - 1]  # -1 because we already visited root
-            
-            # Check timeout before starting
+            # Check timeout before link discovery
             if time.time() - start_time > timeout:
-                logger.warning("Timeout reached before starting contact pages", domain=root_domain)
+                logger.warning("Timeout reached before link discovery", domain=root_domain)
                 result["total_pages"] = len(result["pages_visited"])
                 result["execution_time"] = time.time() - start_time
                 return result
             
-            # Build URLs for contact pages with mapping
-            url_to_page_map = {}
-            contact_urls = []
-            for page in pages_to_try:
-                contact_url = self.url_processor.build_url(base_url, page)
-                url_to_page_map[contact_url] = page
-                contact_urls.append(contact_url)
+            # Discover links from homepage, sitemap, robots.txt, SEO
+            discovered_links = await self.link_discoverer.discover_links(base_url, root_domain)
             
-            # Scrape contact pages (concurrently if enabled)
-            if settings.concurrent_scraping and len(contact_urls) > 1:
+            # Step 5: Build list of URLs to try (discovered links first, then fixed pages)
+            url_to_page_map = {}
+            urls_to_try = []
+            discovered_urls = set()
+            
+            # Add discovered links first (they have higher priority)
+            remaining_pages = max_pages - 1  # -1 for root page already visited
+            for link_info in discovered_links[:remaining_pages]:
+                link_url = link_info.get('url', '')
+                link_path = link_info.get('path', '')
+                
+                if link_url and link_url not in url_to_page_map:
+                    url_to_page_map[link_url] = link_path
+                    urls_to_try.append(link_url)
+                    discovered_urls.add(link_url)
+                    remaining_pages -= 1
+                    
+                    if remaining_pages <= 0:
+                        break
+            
+            # Add fixed contact pages as fallback (if we haven't reached max_pages)
+            fixed_urls_count = 0
+            if remaining_pages > 0:
+                pages_to_try = CONTACT_PAGES[:remaining_pages]
+                for page in pages_to_try:
+                    contact_url = self.url_processor.build_url(base_url, page)
+                    if contact_url not in url_to_page_map:
+                        url_to_page_map[contact_url] = page
+                        urls_to_try.append(contact_url)
+                        fixed_urls_count += 1
+            
+            logger.info("URLs to scrape", 
+                       discovered=len(discovered_urls),
+                       fixed=fixed_urls_count,
+                       total=len(urls_to_try),
+                       domain=root_domain)
+            
+            # Check timeout before starting
+            if time.time() - start_time > timeout:
+                logger.warning("Timeout reached before starting page scraping", domain=root_domain)
+                result["total_pages"] = len(result["pages_visited"])
+                result["execution_time"] = time.time() - start_time
+                return result
+            
+            # Scrape discovered and fixed pages (concurrently if enabled)
+            if settings.concurrent_scraping and len(urls_to_try) > 1:
                 # Check timeout before concurrent scraping
                 if time.time() - start_time > timeout:
                     logger.warning("Timeout reached before concurrent scraping", domain=root_domain)
@@ -132,18 +171,18 @@ class ScrapingOrchestrator:
                     result["execution_time"] = time.time() - start_time
                     return result
                 
-                logger.info("Scraping contact pages concurrently", count=len(contact_urls), domain=root_domain)
-                scraping_results = await self.scraper.scrape_multiple(contact_urls)
+                logger.info("Scraping pages concurrently", count=len(urls_to_try), domain=root_domain)
+                scraping_results = await self.scraper.scrape_multiple(urls_to_try)
             else:
                 # Sequential scraping with timeout checks
                 scraping_results = []
-                for contact_url in contact_urls:
+                for url_to_try in urls_to_try:
                     # Check timeout before each request
                     if time.time() - start_time > timeout:
                         logger.warning("Timeout reached during sequential scraping", domain=root_domain)
                         break
                     
-                    page_result = await self.scraper.scrape_page(contact_url)
+                    page_result = await self.scraper.scrape_page(url_to_try)
                     scraping_results.append(page_result)
                     
                     # Check timeout after each request
@@ -173,8 +212,13 @@ class ScrapingOrchestrator:
                     page_path = normalized_url_to_page.get(normalized_url)
                 
                 # Fallback to index-based lookup if mapping fails
-                if not page_path and i < len(pages_to_try):
-                    page_path = pages_to_try[i]
+                if not page_path and i < len(urls_to_try):
+                    # Try to extract path from URL
+                    try:
+                        parsed = urlparse(urls_to_try[i])
+                        page_path = parsed.path or "/"
+                    except Exception:
+                        page_path = f"page_{i}"
                 
                 # Final fallback
                 if not page_path:
@@ -292,4 +336,5 @@ class ScrapingOrchestrator:
     async def cleanup(self) -> None:
         """Cleanup resources."""
         await self.scraper.close()
+        await self.link_discoverer.close()
 
