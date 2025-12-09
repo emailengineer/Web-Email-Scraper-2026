@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.core.config import settings
 from src.core.logger import configure_logging, get_logger
 from src.api.routes import router, get_orchestrator
+from src.services.cache_manager import CacheManager
 
 # Configure logging
 configure_logging()
@@ -19,6 +20,18 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     # Startup
     logger.info("Starting application", version=settings.app_version)
+    
+    # Clear cache on startup (fresh start for each container restart)
+    try:
+        cache_manager = CacheManager()
+        if cache_manager.enabled:
+            cache_manager.clear_cache()  # Clear all scraper cache
+            logger.info("Cache cleared on startup")
+        else:
+            logger.info("Cache not enabled, skipping cache clear")
+    except Exception as e:
+        logger.warning("Failed to clear cache on startup", error=str(e))
+        # Continue startup even if cache clear fails
     
     # Initialize orchestrator
     orchestrator = get_orchestrator()

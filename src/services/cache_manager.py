@@ -144,18 +144,23 @@ class CacheManager:
         except Exception as e:
             logger.warning("Failed to mark invalid domain", domain=domain, error=str(e))
     
-    def clear_cache(self, domain: Optional[str] = None) -> None:
+    def clear_cache(self, domain: Optional[str] = None, clear_all_redis: bool = False) -> None:
         """
         Clear cache for domain or all cache.
         
         Args:
-            domain: Domain to clear, or None to clear all
+            domain: Domain to clear, or None to clear all scraper cache
+            clear_all_redis: If True, clear entire Redis database (use with caution)
         """
         if not self.enabled or not self.redis_client:
             return
         
         try:
-            if domain:
+            if clear_all_redis:
+                # Clear entire Redis database
+                self.redis_client.flushdb()
+                logger.info("Cleared entire Redis database")
+            elif domain:
                 keys = [
                     self._get_key(domain, "mx"),
                     self._get_key(domain, "invalid")
@@ -169,7 +174,7 @@ class CacheManager:
                 keys = self.redis_client.keys(pattern)
                 if keys:
                     self.redis_client.delete(*keys)
-                logger.info("Cleared all cache", keys_deleted=len(keys) if keys else 0)
+                logger.info("Cleared all scraper cache", keys_deleted=len(keys) if keys else 0)
         except Exception as e:
             logger.error("Failed to clear cache", domain=domain, error=str(e))
             raise CacheException(f"Failed to clear cache: {str(e)}") from e
