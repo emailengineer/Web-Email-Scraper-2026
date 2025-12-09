@@ -77,99 +77,172 @@ class ScrapingOrchestrator:
             logger.info("Scraping root domain", url=base_url)
             root_result = await self.scraper.scrape_page(base_url)
             
+            # Always track root page as visited (even if failed)
+            result["pages_visited"].append("/")
+            
             if root_result["success"]:
-                result["pages_visited"].append("/")
-                
                 # Extract emails from root page
-                emails = self.email_extractor.extract_emails(root_result["html"], base_url)
-                
-                if emails:
-                    # Validate emails
-                    valid_emails = await self._validate_emails(emails, root_domain, "/")
+                try:
+                    emails = self.email_extractor.extract_emails(root_result["html"], base_url)
                     
-                    if valid_emails:
-                        result["emails"] = valid_emails
-                        result["success"] = True
-                        result["total_pages"] = 1
-                        result["execution_time"] = time.time() - start_time
-                        logger.info("Valid emails found on root page", domain=root_domain, count=len(valid_emails))
-                        return result
+                    if emails:
+                        logger.debug("Emails found on root page", count=len(emails), domain=root_domain)
+                        # Validate emails
+                        valid_emails = await self._validate_emails(emails, root_domain, "/")
+                        
+                        if valid_emails:
+                            result["emails"] = valid_emails
+                            result["success"] = True
+                            result["total_pages"] = 1
+                            result["execution_time"] = time.time() - start_time
+                            logger.info("Valid emails found on root page", domain=root_domain, count=len(valid_emails))
+                            return result
+                except Exception as e:
+                    logger.warning("Email extraction failed on root page", domain=root_domain, error=str(e))
+            else:
+                logger.warning("Root page scraping failed", domain=root_domain, error=root_result.get("error"))
             
             # Step 4: If no valid emails found, try contact pages
             logger.info("No valid emails on root, trying contact pages", domain=root_domain)
             
-            # Limit pages to visit
+            # Limit pages to visit (accounting for root page already visited)
             pages_to_try = CONTACT_PAGES[:max_pages - 1]  # -1 because we already visited root
             
-            # Build URLs for contact pages
-            contact_urls = [
-                self.url_processor.build_url(base_url, page)
-                for page in pages_to_try
-            ]
+            # Check timeout before starting
+            if time.time() - start_time > timeout:
+                logger.warning("Timeout reached before starting contact pages", domain=root_domain)
+                result["total_pages"] = len(result["pages_visited"])
+                result["execution_time"] = time.time() - start_time
+                return result
+            
+            # Build URLs for contact pages with mapping
+            url_to_page_map = {}
+            contact_urls = []
+            for page in pages_to_try:
+                contact_url = self.url_processor.build_url(base_url, page)
+                url_to_page_map[contact_url] = page
+                contact_urls.append(contact_url)
             
             # Scrape contact pages (concurrently if enabled)
-            if settings.concurrent_scraping:
+            if settings.concurrent_scraping and len(contact_urls) > 1:
+                # Check timeout before concurrent scraping
+                if time.time() - start_time > timeout:
+                    logger.warning("Timeout reached before concurrent scraping", domain=root_domain)
+                    result["total_pages"] = len(result["pages_visited"])
+                    result["execution_time"] = time.time() - start_time
+                    return result
+                
+                logger.info("Scraping contact pages concurrently", count=len(contact_urls), domain=root_domain)
                 scraping_results = await self.scraper.scrape_multiple(contact_urls)
             else:
+                # Sequential scraping with timeout checks
                 scraping_results = []
                 for contact_url in contact_urls:
+                    # Check timeout before each request
                     if time.time() - start_time > timeout:
-                        logger.warning("Timeout reached, stopping scraping", domain=root_domain)
+                        logger.warning("Timeout reached during sequential scraping", domain=root_domain)
                         break
                     
                     page_result = await self.scraper.scrape_page(contact_url)
                     scraping_results.append(page_result)
+                    
+                    # Check timeout after each request
+                    if time.time() - start_time > timeout:
+                        logger.warning("Timeout reached after scraping page", domain=root_domain)
+                        break
             
-            # Process results
+            # Process all results - track both successful and failed pages
             all_emails: Set[str] = set()
+            found_valid_email = False
+            
+            # Create reverse mapping for easier lookup (normalize URLs for matching)
+            normalized_url_to_page = {}
+            for url, page in url_to_page_map.items():
+                normalized_url = self.url_processor.normalize_url(url)
+                normalized_url_to_page[normalized_url] = page
             
             for i, page_result in enumerate(scraping_results):
+                # Get the page path from URL mapping
+                page_url = page_result.get("url", "")
+                
+                # Try to find page path from mapping (handle URL normalization)
+                page_path = url_to_page_map.get(page_url)
+                if not page_path:
+                    # Try normalized URL
+                    normalized_url = self.url_processor.normalize_url(page_url) if page_url else ""
+                    page_path = normalized_url_to_page.get(normalized_url)
+                
+                # Fallback to index-based lookup if mapping fails
+                if not page_path and i < len(pages_to_try):
+                    page_path = pages_to_try[i]
+                
+                # Final fallback
+                if not page_path:
+                    page_path = f"page_{i}"
+                    logger.warning("Could not map URL to page path", url=page_url, index=i)
+                
+                # Track all pages attempted (both successful and failed)
+                if page_path not in result["pages_visited"]:
+                    result["pages_visited"].append(page_path)
+                
+                # Skip processing if page scraping failed
                 if not page_result["success"]:
+                    logger.debug("Page scraping failed, skipping email extraction", 
+                               page=page_path, error=page_result.get("error"))
                     continue
                 
-                page_path = CONTACT_PAGES[i]
-                result["pages_visited"].append(page_path)
-                
-                # Extract emails
-                page_emails = self.email_extractor.extract_emails(page_result["html"], page_result["url"])
-                all_emails.update(page_emails)
-                
-                # Validate emails found on this page
-                if page_emails:
-                    valid_emails = await self._validate_emails(page_emails, root_domain, page_path)
-                    
-                    if valid_emails:
-                        result["emails"].extend(valid_emails)
-                        result["success"] = True
-                        result["total_pages"] = len(result["pages_visited"])
-                        result["execution_time"] = time.time() - start_time
-                        logger.info("Valid emails found", domain=root_domain, page=page_path, count=len(valid_emails))
-                        return result
-                
-                # Check timeout
+                # Check timeout during processing
                 if time.time() - start_time > timeout:
-                    logger.warning("Timeout reached", domain=root_domain)
+                    logger.warning("Timeout reached during result processing", domain=root_domain)
                     break
                 
-                # Check max pages
+                # Extract emails from successful page
+                try:
+                    page_emails = self.email_extractor.extract_emails(page_result["html"], page_result["url"])
+                    all_emails.update(page_emails)
+                    
+                    # Validate emails found on this page
+                    if page_emails:
+                        valid_emails = await self._validate_emails(page_emails, root_domain, page_path)
+                        
+                        if valid_emails:
+                            result["emails"].extend(valid_emails)
+                            found_valid_email = True
+                            logger.info("Valid emails found", domain=root_domain, page=page_path, count=len(valid_emails))
+                            # Continue processing to find all emails, but we found at least one
+                except Exception as e:
+                    logger.warning("Email extraction failed", page=page_path, error=str(e))
+                    continue
+                
+                # Check max pages limit
                 if len(result["pages_visited"]) >= max_pages:
-                    logger.info("Max pages reached", domain=root_domain)
+                    logger.info("Max pages reached", domain=root_domain, pages=len(result["pages_visited"]))
                     break
             
-            # If we have emails but none validated, still return them
-            if all_emails:
+            # If we collected emails but haven't validated them all yet, validate now
+            if all_emails and not found_valid_email:
                 # Validate all collected emails
                 all_valid_emails = await self._validate_emails(all_emails, root_domain, "multiple")
                 result["emails"] = all_valid_emails
                 result["success"] = len(all_valid_emails) > 0
+            elif found_valid_email:
+                # We already have validated emails, just mark success
+                result["success"] = True
             
             result["total_pages"] = len(result["pages_visited"])
             result["execution_time"] = time.time() - start_time
             
+            # Count successful vs failed pages
+            successful_pages = sum(1 for r in scraping_results if r.get("success", False))
+            failed_pages = len(scraping_results) - successful_pages
+            
             logger.info("Scraping completed", 
                        domain=root_domain, 
-                       pages=result["total_pages"],
+                       pages_attempted=len(result["pages_visited"]),
+                       pages_successful=successful_pages + (1 if root_result.get("success") else 0),
+                       pages_failed=failed_pages + (0 if root_result.get("success") else 1),
                        emails_found=len(result["emails"]),
+                       emails_extracted=len(all_emails),
                        execution_time=result["execution_time"])
             
         except Exception as e:
